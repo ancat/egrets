@@ -3,7 +3,6 @@ package egrets
 import (
         "bytes"
         "encoding/binary"
-        "encoding/hex"
         "encoding/json"
         "fmt"
         "net"
@@ -124,33 +123,46 @@ func Main(ebpf_binary string, host_match string) {
     }
 
     event_table := mod.Map("events")
-    channel := make(chan []byte)
-    lost_chan := make(chan uint64)
-    pm, _ := elf.InitPerfMap(mod, "events", channel, lost_chan)
-    pm.PollStart()
     if event_table == nil {
         dns_log.Fatalf("Couldn't find events table!")
     }
 
+    channel := make(chan []byte)
+    lost_chan := make(chan uint64)
+    pm, _ := elf.InitPerfMap(mod, "events", channel, lost_chan)
+    pm.PollStart()
+
     log.Debugf("yer fd: %d\n", fd)
 
-    err = syscall.SetNonblock(fd, false)
+    err = syscall.SetNonblock(fd, true)
     if err != nil {
         log.Fatalf("failed to set AF_PACKET to blocking: %s", err)
     }
 
-    pee := os.NewFile(uintptr(fd), "hehe")
-    if pee == nil {
+    dns_stream := os.NewFile(uintptr(fd), "hehe")
+    if dns_stream == nil {
         log.Fatalf("couldn't turn fd into a file")
     }
 
-    stopChan := make(chan struct{})
-    go func() {
+    go process_dns(dns_stream)
+    process_tcp(channel, lost_chan)
+}
+
+func process_dns(dns_stream *os.File) {
+    fmt.Printf("starting dns boye\n")
+    // we should be using channels for this
+    // https://www.openwall.com/lists/musl/2018/10/11/2
+    for {
+        byte_chunk := make([]byte, 2048)
+        readAndProcess(dns_stream, byte_chunk)
+    }
+}
+
+func process_tcp(receiver chan []byte, lost chan uint64) {
+        fmt.Printf("tcp processing starting\n")
         for {
             select {
-            case <-stopChan:
-                return
-            case data, ok := <-channel:
+            case data, ok := <-receiver:
                 if !ok {
                     return
                 }
@@ -210,20 +222,13 @@ func Main(ebpf_binary string, host_match string) {
                     container_ip,
                     )
                 }
-            case _, ok := <-lost_chan:
+            case _, ok := <-lost:
                 if !ok {
                     return
                 }
             }
         }
-    }()
 
-    // we should be using channels for this
-    // https://www.openwall.com/lists/musl/2018/10/11/2
-    for {
-        byte_chunk := make([]byte, 2048)
-        readAndProcess(pee, byte_chunk)
-    }
 }
 
 func extract_dns(chunk []byte, size int) gopacket.Packet {
@@ -245,11 +250,6 @@ func readAndProcess(handle *os.File, chunk []byte) {
     count, _ := handle.Read(chunk)
     if count == 0 {
         return
-    }
-
-    if 1 == 0 {
-        encodedStr := hex.Dump(chunk)
-        fmt.Printf("%s\n", encodedStr)
     }
 
     packet := gopacket.NewPacket(chunk[:count], layers.LayerTypeEthernet, gopacket.NoCopy)
