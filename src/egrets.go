@@ -134,7 +134,7 @@ func Main(ebpf_binary string, host_match string) {
 
     log.Debugf("yer fd: %d\n", fd)
 
-    err = syscall.SetNonblock(fd, true)
+    err = syscall.SetNonblock(fd, false)
     if err != nil {
         log.Fatalf("failed to set AF_PACKET to blocking: %s", err)
     }
@@ -154,7 +154,12 @@ func process_dns(dns_stream *os.File) {
     // https://www.openwall.com/lists/musl/2018/10/11/2
     for {
         byte_chunk := make([]byte, 2048)
-        readAndProcess(dns_stream, byte_chunk)
+        length, _ := dns_stream.Read(byte_chunk)
+        if length == 0 {
+            continue
+        }
+
+        go readAndProcess(byte_chunk, length)
     }
 }
 
@@ -167,68 +172,72 @@ func process_tcp(receiver chan []byte, lost chan uint64) {
                     return
                 }
 
-                var event tcp_v4
                 buffer := bytes.NewBuffer(data)
+                var event tcp_v4
                 err := binary.Read(buffer, binary.LittleEndian, &event)
                 if err != nil {
                     panic(err)
                 }
-                // exclude stuff bound to 0.0.0.0
-                // remember that these include udp too
-                if event.Addr == 0 {
-                    // dns_log.Errorf("family: %d, addr: %d\n", event.Family, event.Addr)
-                    continue
-                }
 
-                pid := int(event.Pid & 0xFFFFFFFF)
-                var container_info *ContainerInfo
-                if pid_to_namespace[pid] != nil {
-                    container_info = pid_to_namespace[pid]
-                } else {
-                    container_info = GetContainerInfo(pid)
-                    pid_to_namespace[pid] = container_info
-                }
-
-                container_hostname := "none"
-                container_image := "none"
-                container_ip := "none"
-                if container_info != nil {
-                    container_image = container_info.Image
-                    container_ip = container_info.IpAddress
-                    container_hostname = container_info.Hostname
-                }
-
-                ip_address := Long2ip(event.Addr)
-                dns_name := ip_to_hostname[ip_address]
-                if !acceptable_hosts.Match([]byte(dns_name)) {
-                    dns_log.Warnf(
-                        "alert.egress comm=%s pid=%d connection=%s:%d dns.entry=%s\n",
-                        event.Comm,
-                        pid,
-                        ip_address,
-                        event.Port,
-                        dns_name,
-                        )
-                } else {
-                    dns_log.Printf(
-                    "process.tcp_v4 comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
-                    event.Comm,
-                    pid,
-                    ip_address,
-                    event.Port,
-                    dns_name,
-                    container_image,
-                    container_hostname,
-                    container_ip,
-                    )
-                }
+                go parse_tcp_event(event)
             case _, ok := <-lost:
                 if !ok {
                     return
                 }
             }
         }
+}
 
+func parse_tcp_event(event tcp_v4) {
+    // exclude stuff bound to 0.0.0.0
+    // remember that these include udp too
+    if event.Addr == 0 {
+        // dns_log.Errorf("family: %d, addr: %d\n", event.Family, event.Addr)
+        return
+    }
+
+    pid := int(event.Pid & 0xFFFFFFFF)
+    var container_info *ContainerInfo
+    if pid_to_namespace[pid] != nil {
+        container_info = pid_to_namespace[pid]
+    } else {
+        container_info = GetContainerInfo(pid)
+        pid_to_namespace[pid] = container_info
+    }
+
+    container_hostname := "none"
+    container_image := "none"
+    container_ip := "none"
+    if container_info != nil {
+        container_image = container_info.Image
+        container_ip = container_info.IpAddress
+        container_hostname = container_info.Hostname
+    }
+
+    ip_address := Long2ip(event.Addr)
+    dns_name := ip_to_hostname[ip_address]
+    if !acceptable_hosts.Match([]byte(dns_name)) {
+        dns_log.Warnf(
+            "alert.egress comm=%s pid=%d connection=%s:%d dns.entry=%s\n",
+            event.Comm,
+            pid,
+            ip_address,
+            event.Port,
+            dns_name,
+            )
+    } else {
+        dns_log.Printf(
+        "process.tcp_v4 comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
+        event.Comm,
+        pid,
+        ip_address,
+        event.Port,
+        dns_name,
+        container_image,
+        container_hostname,
+        container_ip,
+        )
+    }
 }
 
 func extract_dns(chunk []byte, size int) gopacket.Packet {
@@ -246,13 +255,8 @@ func extract_dns(chunk []byte, size int) gopacket.Packet {
     return packet
 }
 
-func readAndProcess(handle *os.File, chunk []byte) {
-    count, _ := handle.Read(chunk)
-    if count == 0 {
-        return
-    }
-
-    packet := gopacket.NewPacket(chunk[:count], layers.LayerTypeEthernet, gopacket.NoCopy)
+func readAndProcess(chunk []byte, length int) {
+    packet := gopacket.NewPacket(chunk[:length], layers.LayerTypeEthernet, gopacket.NoCopy)
 
     dns_packet := packet.Layer(layers.LayerTypeDNS)
     if dns_packet == nil {
