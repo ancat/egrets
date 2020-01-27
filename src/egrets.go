@@ -85,6 +85,7 @@ func Main(ebpf_binary string, host_match string) {
     dns_log = GetLogger("DNS")
     ip_to_hostname = make(map[string]string)
     pid_to_namespace = make(map[int]*ContainerInfo)
+    events = make([]string, 0, 1000)
     var secParams = map[string]elf.SectionParams{
         "maps/events": elf.SectionParams{PerfRingBufferPageCount: 256},
     }
@@ -345,11 +346,14 @@ func extract_dns(chunk []byte, size int) gopacket.Packet {
 func log_dns_event(dns *layers.DNS) {
     if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
         fmt.Printf("====\n")
-        for _, event := range events {
-            fmt.Printf("event: %s", event)
+        for i, event := range events {
+            if event != "" {
+                fmt.Printf("event[%d] = %s", i, event)
+            }
         }
 
-        events = make([]string, 0)
+        events = make([]string, 0, 1000)
+        ip_to_hostname = make(map[string]string)
 
         if 1 == 0 {
             b, err := json.MarshalIndent(ip_to_hostname, "", "  ")
