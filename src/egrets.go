@@ -10,7 +10,6 @@ import (
         "os"
         "regexp"
         "syscall"
-        "unsafe"
 
         "github.com/google/gopacket"
         "github.com/google/gopacket/afpacket"
@@ -19,10 +18,6 @@ import (
         "github.com/iovisor/gobpf/elf"
         "golang.org/x/net/bpf"
         log "github.com/sirupsen/logrus"
-)
-
-import (
-
 )
 
 type TextFormatter struct {
@@ -61,6 +56,7 @@ func Long2ip(ipLong uint32) string {
 
 var processed_count int
 var ip_to_hostname map[string]string
+// consider caching namespace -> container info
 var pid_to_namespace map[int]*ContainerInfo
 var dns_log *log.Logger
 var acceptable_hosts *regexp.Regexp
@@ -86,74 +82,21 @@ func Main(ebpf_binary string, host_match string) {
     ip_to_hostname = make(map[string]string)
     pid_to_namespace = make(map[int]*ContainerInfo)
     events = make([]string, 0, 1000)
-    var secParams = map[string]elf.SectionParams{
-        "maps/events": elf.SectionParams{PerfRingBufferPageCount: 256},
-    }
 
-    mod := elf.NewModule(ebpf_binary)
-    if mod == nil  {
+    mod, err := LoadModuleElf(ebpf_binary)
+    if err != nil {
         panic("nil module")
-    }
-
-    if err := mod.Load(secParams); err != nil  {
-        panic(err)
     }
 
     // we should use old sk00l bpf here instead
     // https://godoc.org/github.com/google/gopacket/pcap#hdr-Reading_Live_Packets
-    socketFilter := mod.SocketFilter("socket/filter_udp")
-    if socketFilter == nil {
-        panic("couldn't locate filter_udp")
-    }
-
-    fd, err := syscall.Socket(
-        syscall.AF_PACKET,
-        syscall.SOCK_RAW|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK,
-        0x300,
-    )
-
-    sockaddr := syscall.RawSockaddrLinklayer{
-        Family: syscall.AF_PACKET,
-        Protocol: 0x0300,
-        Ifindex: 2,
-        Pkttype: syscall.PACKET_HOST,
-    }
-
-    _, _, e := syscall.Syscall(
-        syscall.SYS_BIND,
-        uintptr(fd),
-        uintptr(unsafe.Pointer(&sockaddr)),
-        unsafe.Sizeof(sockaddr));
-    if e > 0 {
-        panic(e)
-    }
-
+    fd, socketFilter, err := GetSocketFilter(mod, "socket/filter_udp")
     if err != nil {
         panic(err)
     }
-    defer syscall.Close(fd)
-
-    if err := elf.AttachSocketFilter(socketFilter, fd); err != nil {
-        dns_log.Fatalf("Failed to attach socket filter: %s\nMake sure you are running as root and that debugfs is mounted!", err)
-    }
 
     defer elf.DetachSocketFilter(socketFilter, fd)
-
-    if err := mod.EnableKprobe("kprobe/sys_connect", 1); err != nil {
-        dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
-    }
-
-    event_table := mod.Map("events")
-    if event_table == nil {
-        dns_log.Fatalf("Couldn't find events table!")
-    }
-
-    channel := make(chan []byte)
-    lost_chan := make(chan uint64)
-    pm, _ := elf.InitPerfMap(mod, "events", channel, lost_chan)
-    pm.PollStart()
-
-    log.Debugf("yer fd: %d\n", fd)
+    defer syscall.Close(fd)
 
     err = syscall.SetNonblock(fd, false)
     if err != nil {
@@ -165,11 +108,22 @@ func Main(ebpf_binary string, host_match string) {
         log.Fatalf("couldn't turn fd into a file")
     }
 
-    //go process_dns(dns_stream)
-    afpacketHandle := get_packet_handle("udp and port 53")
-    defer afpacketHandle.Close()
+    if err := mod.EnableKprobe("kprobe/sys_connect", 1); err != nil {
+        dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+    }
+
+    channel := make(chan []byte)
+    lost_chan := make(chan uint64)
+    err = GetMap(mod, "events", channel, lost_chan)
+    if err != nil {
+        panic(err)
+    }
+
     go process_tcp(channel, lost_chan)
+
     if *use_bpf {
+        afpacketHandle := get_packet_handle("udp and port 53")
+        defer afpacketHandle.Close()
         process_alt_dns(afpacketHandle)
     } else {
         process_dns(dns_stream)
@@ -266,7 +220,6 @@ func process_tcp(receiver chan []byte, lost chan uint64) {
                     panic(err)
                 }
 
-                //events = append(events, fmt.Sprintf("tcpeve %d %d\n", tcp_start, event.Port))
                 go parse_tcp_event(event)
             case _, ok := <-lost:
                 if !ok {
@@ -304,16 +257,6 @@ func parse_tcp_event(event tcp_v4) {
 
     ip_address := Long2ip(event.Addr)
     dns_name := ip_to_hostname[ip_address]
-    /*if !acceptable_hosts.Match([]byte(dns_name)) {
-        dns_log.Warnf(
-            "alert.egress comm=%s pid=%d connection=%s:%d dns.entry=%s\n",
-            event.Comm,
-            pid,
-            ip_address,
-            event.Port,
-            dns_name,
-            )
-    } else {*/
     events = append(events, fmt.Sprintf(
     "process.tcp_v4 comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
     event.Comm,
@@ -325,7 +268,6 @@ func parse_tcp_event(event tcp_v4) {
     container_hostname,
     container_ip,
     ))
-    //}
 }
 
 func extract_dns(chunk []byte, size int) gopacket.Packet {
