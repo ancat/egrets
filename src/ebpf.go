@@ -12,7 +12,7 @@ import (
 func LoadModuleElf(path string) (*elf.Module, error) {
     mod := elf.NewModule(path)
     if mod == nil {
-        return nil, errors.New("fuck u")
+        return nil, fmt.Errorf("failed to load elf at %s", path)
     }
 
     var secParams = map[string]elf.SectionParams{}
@@ -27,7 +27,7 @@ func LoadModuleElf(path string) (*elf.Module, error) {
 func GetSocketFilter(module *elf.Module, filter_name string) (int, *elf.SocketFilter, error) {
     socketFilter := module.SocketFilter(filter_name)
     if socketFilter == nil {
-        panic("couldn't locate filter_udp")
+        return -1, nil, fmt.Errorf("failed to find socket filter %s", filter_name)
     }
 
     fd, err := syscall.Socket(
