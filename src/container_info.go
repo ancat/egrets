@@ -37,7 +37,7 @@ func GetCpusetCgroup(pid int) []byte {
     cgroup_path := fmt.Sprintf("/proc/%d/cgroup", pid)
     cgroup_data, err := ioutil.ReadFile(cgroup_path)
     if err != nil {
-        panic(err)
+        return nil
     }
 
     lines := bytes.Split(cgroup_data, []byte("\n"))

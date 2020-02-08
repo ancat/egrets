@@ -15,6 +15,7 @@ $ git clone https://github.com/ancat/egrets.git
 $ cd egrets
 
 # build
+$ apt-get install libpcap0.8-dev
 $ make
 
 # run
