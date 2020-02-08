@@ -88,8 +88,6 @@ func Main(ebpf_binary string, host_match string) {
         panic("nil module")
     }
 
-    // we should use old sk00l bpf here instead
-    // https://godoc.org/github.com/google/gopacket/pcap#hdr-Reading_Live_Packets
     fd, socketFilter, err := GetSocketFilter(mod, "socket/filter_udp")
     if err != nil {
         panic(err)
@@ -242,7 +240,8 @@ func parse_tcp_event(event tcp_v4) {
     if pid_to_namespace[pid] != nil {
         container_info = pid_to_namespace[pid]
     } else {
-        container_info = nil//GetContainerInfo(pid)
+        events = append(events, fmt.Sprintf("querying container info pid=%d\n", pid))
+        container_info = GetContainerInfo(pid)
         pid_to_namespace[pid] = container_info
     }
 
