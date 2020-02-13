@@ -8,7 +8,6 @@ import (
         "fmt"
         "net"
         "os"
-        "regexp"
         "syscall"
 
         "github.com/google/gopacket"
@@ -59,9 +58,12 @@ var ip_to_hostname map[string]string
 // consider caching namespace -> container info
 var pid_to_namespace map[int]*ContainerInfo
 var dns_log *log.Logger
-var acceptable_hosts *regexp.Regexp
 var events []string
-var use_bpf = flag.Bool("b", false, "whatever man")
+
+var dump_config = flag.Bool("d", false, "dump the parsed config and exit")
+var config_file = flag.String("f", "config.yaml", "config file (default `config.yaml`")
+var config *EgretsConfig
+var ipv4map = IpNode{}
 
 func GetLogger(logger_name string) *log.Logger  {
     logger := log.New()
@@ -75,9 +77,14 @@ func GetLogger(logger_name string) *log.Logger  {
     return logger
 }
 
-func Main(ebpf_binary string, host_match string) {
+func Main(ebpf_binary string) {
     flag.Parse()
-    acceptable_hosts = regexp.MustCompile(host_match)
+    config = LoadEgretsConfig(*config_file)
+	if *dump_config {
+        DumpConfig(config)
+        return
+    }
+
     dns_log = GetLogger("DNS")
     ip_to_hostname = make(map[string]string)
     pid_to_namespace = make(map[int]*ContainerInfo)
@@ -119,7 +126,7 @@ func Main(ebpf_binary string, host_match string) {
 
     go process_tcp(channel, lost_chan)
 
-    if *use_bpf {
+    if config.Use_Classic_BPF {
         afpacketHandle := get_packet_handle("udp and port 53")
         defer afpacketHandle.Close()
         process_alt_dns(afpacketHandle)
@@ -254,15 +261,30 @@ func parse_tcp_event(event tcp_v4) {
         container_hostname = container_info.Hostname
     }
 
+
     ip_address := Long2ip(event.Addr)
     dns_name := ip_to_hostname[ip_address]
+
+    ip_tags  := ipv4map.get_tags(int(event.Addr))
+    dns_name_alt := ""
+    if ip_tags != nil {
+        dns_name_alt = ip_tags[0]
+    }
+
+    // this checks only the hash table, which assumes ip:host is 1:1
+    // the bst assumes ip:host is 1:many (more realistic) but I don't
+    // feel like implementing something to check if two arrays overlap
+    // it also doesn't check the container specific allow list
+    allowed := tag_exists(config.Allow, dns_name)
     events = append(events, fmt.Sprintf(
-    "process.tcp_v4 comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
+    "process.tcp_v4 comm=%s pid=%d connection=%s:%d allowed=%t dns.entry=%s dns.entry2=%s container.image=%s container.hostname=%s container.ip=%s\n",
     event.Comm,
     pid,
     ip_address,
     event.Port,
+    allowed,
     dns_name,
+    dns_name_alt,
     container_image,
     container_hostname,
     container_ip,
@@ -316,6 +338,7 @@ func log_dns_event(dns *layers.DNS) {
                         fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
                         )
                 case layers.DNSTypeA:
+                    ipv4map.insert(ipv4toint(answer.IP), []string{string(dns.Questions[0].Name)})
                     ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
                     events = append(
                         events,

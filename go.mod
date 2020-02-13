@@ -7,4 +7,5 @@ require (
 	github.com/iovisor/gobpf v0.0.0-20190827113749-5e47cda1484e
 	github.com/sirupsen/logrus v1.4.2
 	golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3
+	gopkg.in/yaml.v2 v2.2.8
 )

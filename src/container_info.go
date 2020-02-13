@@ -25,6 +25,14 @@ func GetContainerInfo(pid int) *ContainerInfo {
         return nil
     }
 
+    if bytes.Equal(cgroup_name, []byte("fail")) {
+        cinfo := ContainerInfo{}
+        cinfo.Hostname = "fail"
+        cinfo.IpAddress = "fail"
+        cinfo.Image = "fail"
+        return &cinfo
+    }
+
     if bytes.Contains(cgroup_name, []byte("/docker")) {
         container_id := bytes.TrimPrefix(cgroup_name, []byte("/docker/"))
         return GetDockerMetadata(container_id)
@@ -37,7 +45,7 @@ func GetCpusetCgroup(pid int) []byte {
     cgroup_path := fmt.Sprintf("/proc/%d/cgroup", pid)
     cgroup_data, err := ioutil.ReadFile(cgroup_path)
     if err != nil {
-        return nil
+        return []byte("fail")
     }
 
     lines := bytes.Split(cgroup_data, []byte("\n"))

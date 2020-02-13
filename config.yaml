@@ -1,0 +1,20 @@
+container_metadata: true
+# classic bpf is borked
+use_classic_bpf: false
+allow:
+    - deb.debian.org
+    - repo.iovisor.org
+    - apt.llvm.org
+    - ppa.launchpad.net
+    - mirrors.digitalocean.com
+    - packagecloud.io
+    - d28dx6y1hfq314.cloudfront.net
+    - deb.nodesource.com
+    - security.debian.org
+    - security.ubuntu.com
+    - download.docker.com
+container_allow:
+    gremlinweb:
+        - security.debian.org
+        - deb.debian.org
+        - security-cdn.debian.org
