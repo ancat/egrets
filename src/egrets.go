@@ -3,7 +3,6 @@ package egrets
 import (
         "bytes"
         "encoding/binary"
-        "encoding/json"
         "flag"
         "fmt"
         "net"
@@ -56,12 +55,12 @@ var ip_to_hostname map[string]string
 // consider caching namespace -> container info
 var pid_to_namespace map[int]*ContainerInfo
 var dns_log *log.Logger
-var events []string
 
 var dump_config = flag.Bool("d", false, "dump the parsed config and exit")
 var config_file = flag.String("f", "config.yaml", "config file (default `config.yaml`")
 var config *EgretsConfig
 var ipv4map = IpNode{}
+var event_channel chan string
 
 func GetLogger(logger_name string) *log.Logger  {
     logger := log.New()
@@ -83,10 +82,17 @@ func Main(ebpf_binary string) {
         return
     }
 
+    event_channel = make(chan string)
+    go func() {
+        for {
+            event_string := <-event_channel
+            fmt.Printf("%s", event_string)
+        }
+    }()
+
     dns_log = GetLogger("DNS")
     ip_to_hostname = make(map[string]string)
     pid_to_namespace = make(map[int]*ContainerInfo)
-    events = make([]string, 0, 1000)
 
     mod, err := LoadModuleElf(ebpf_binary)
     if err != nil {
@@ -219,10 +225,11 @@ func parse_tcp_event(event tcp_v4) {
     container_ip := "none"
 
     if config.Container_Metadata {
+        // FIXME: data race in pid_to_namespace
         if pid_to_namespace[pid] != nil {
             container_info = pid_to_namespace[pid]
         } else {
-            // events = append(events, fmt.Sprintf("querying container info pid=%d\n", pid))
+            event_channel <- fmt.Sprintf("querying container info pid=%d\n", pid)
             container_info = GetContainerInfo(pid)
             pid_to_namespace[pid] = container_info
         }
@@ -239,6 +246,7 @@ func parse_tcp_event(event tcp_v4) {
         return
     }
 
+    // FIXME: data race in ip_to_hostname
     dns_name := ip_to_hostname[ip_address]
 
     ip_tags  := ipv4map.get_tags(int(event.Addr))
@@ -258,12 +266,12 @@ func parse_tcp_event(event tcp_v4) {
     allowed := tag_exists(config.Allow, dns_name)
     if dns_name == "" {
         // FIXME: oddly enough, this only happens when container metadata is enabled
-        events = append(events, fmt.Sprintf("process.missing comm=%s pid=%d connection=%s:%d\n", event.Comm, pid, ip_address, event.Port))
+        event_channel <- fmt.Sprintf("process.missing comm=%s pid=%d connection=%s:%d\n", event.Comm, pid, ip_address, event.Port)
     }
 
     if config.Log_Blocked {
         if !allowed {
-            events = append(events, fmt.Sprintf(
+            event_channel <- fmt.Sprintf(
                 "process.blocked comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
                 event.Comm,
                 pid,
@@ -273,10 +281,10 @@ func parse_tcp_event(event tcp_v4) {
                 container_image,
                 container_hostname,
                 container_ip,
-            ))
+            )
         }
     } else {
-        events = append(events, fmt.Sprintf(
+        event_channel <- fmt.Sprintf(
         "process.tcp_v4 comm=%s pid=%d connection=%s:%d allowed=%t dns.entry=%s dns.entry2=%s container.image=%s container.hostname=%s container.ip=%s\n",
         event.Comm,
         pid,
@@ -288,7 +296,7 @@ func parse_tcp_event(event tcp_v4) {
         container_image,
         container_hostname,
         container_ip,
-        ))
+        )
     }
 }
 
@@ -308,6 +316,8 @@ func extract_dns(chunk []byte, size int) gopacket.Packet {
 }
 
 func log_dns_event(dns *layers.DNS) {
+    var dns_event string
+
     if len(dns.Answers) > 0 {
         for _, answer := range dns.Answers {
             switch answer.Type {
@@ -315,59 +325,31 @@ func log_dns_event(dns *layers.DNS) {
                     fmt.Printf("unknown dns type: %s\n", answer.Type.String())
                 case layers.DNSTypeAAAA:
                     ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
-                    if config.Log_Dns {
-                        events = append(
-                            events,
-                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
-                            )
-                    }
+                    dns_event = fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP)
                 case layers.DNSTypeA:
                     ipv4map.insert(ipv4toint(answer.IP), []string{string(dns.Questions[0].Name)})
                     ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
-                    if config.Log_Dns {
-                        events = append(
-                            events,
-                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
-                            )
-                    }
+                    dns_event = fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP)
                 case layers.DNSTypeCNAME:
                     ip_to_hostname[string(answer.CNAME)] = string(dns.Questions[0].Name)
-                    if config.Log_Dns {
-                        events = append(
-                            events,
-                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.CNAME),
-                            )
-                    }
+                    dns_event = fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.CNAME)
+            }
+
+            if config.Log_Dns {
+                event_channel <- dns_event
             }
         }
     } else if len(dns.Questions) > 0 {
         if config.Log_Dns {
-            events = append(
-                events,
-                fmt.Sprintf("dns.query hostname=%s type=%s\n", dns.Questions[0].Name, dns.Questions[0].Type.String()),
-                )
+            dns_event = fmt.Sprintf("dns.query hostname=%s type=%s\n", dns.Questions[0].Name, dns.Questions[0].Type.String())
+            event_channel <- dns_event
         }
     } else {
         fmt.Printf("we have no answers fuq\n")
     }
 
     if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
-        fmt.Printf("====\n")
-        for i, event := range events {
-            if event != "" {
-                fmt.Printf("event[%d] = %s", i, event)
-            }
-        }
-
-        events = make([]string, 0, 1000)
         ip_to_hostname = make(map[string]string)
-
-        if 1 == 0 {
-            b, err := json.MarshalIndent(ip_to_hostname, "", "  ")
-            if err == nil {
-                fmt.Printf("%s\n", string(b))
-            }
-        }
     }
 }
 
