@@ -1,6 +1,11 @@
+# if you don't use containers, save the lookup time
 container_metadata: true
+log_blocked: true
+log_dns: true
+
 # classic bpf is borked
 use_classic_bpf: false
+trusted_dns: 67.207.67.3
 allow:
     - deb.debian.org
     - repo.iovisor.org

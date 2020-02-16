@@ -25,6 +25,8 @@ func GetContainerInfo(pid int) *ContainerInfo {
         return nil
     }
 
+    // this makes spotting failures more obvious without having to crash
+    // or worse, assume that there's no container info
     if bytes.Equal(cgroup_name, []byte("fail")) {
         cinfo := ContainerInfo{}
         cinfo.Hostname = "fail"

@@ -6,6 +6,10 @@ import (
         "syscall"
         "unsafe"
 
+        "github.com/google/gopacket/afpacket"
+        "github.com/google/gopacket/layers"
+        "github.com/google/gopacket/pcap"
+        "golang.org/x/net/bpf"
         "github.com/iovisor/gobpf/elf"
 )
 
@@ -79,4 +83,44 @@ func GetMap(
     pm.PollStart()
 
     return nil
+}
+
+func GetPacketHandle(bpf_filter string) (*afpacket.TPacket, error) {
+    var afpacketHandle *afpacket.TPacket
+    var err error
+
+    afpacketHandle, err = afpacket.NewTPacket(
+        afpacket.OptFrameSize(65536),
+        afpacket.OptBlockSize(8388608),
+        afpacket.OptNumBlocks(1),
+        afpacket.OptAddVLANHeader(false),
+        afpacket.OptPollTimeout(-10000000),
+        afpacket.SocketRaw,
+        afpacket.TPacketVersion3)
+
+    if err != nil {
+        return nil, err
+    }
+
+    pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, 65536, bpf_filter)
+    if err != nil {
+        return nil, err
+    }
+
+    bpfIns := []bpf.RawInstruction{}
+    for _, ins := range pcapBPF {
+        bpfIns2 := bpf.RawInstruction{
+            Op: ins.Code,
+            Jt: ins.Jt,
+            Jf: ins.Jf,
+            K:  ins.K,
+        }
+        bpfIns = append(bpfIns, bpfIns2)
+    }
+
+    if afpacketHandle.SetBPF(bpfIns); err != nil {
+        return nil, err
+    }
+
+    return afpacketHandle, nil
 }

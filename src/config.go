@@ -10,7 +10,10 @@ import (
 type EgretsConfig struct {
     Container_Metadata bool
     Use_Classic_BPF bool
+    Log_Blocked bool
+    Log_Dns bool
     Allow []string
+    Trusted_Dns string
     Container_Allow map[string][]string
 }
 
@@ -34,7 +37,11 @@ func DumpConfig(config *EgretsConfig) {
     if config.Container_Metadata {
         fmt.Printf("we will fetch container metadata\n")
     } else {
-        fmt.Printf("we will not fetch container metadata")
+        fmt.Printf("we will not fetch container metadata\n")
+    }
+
+    if config.Log_Blocked {
+        fmt.Printf("we will only log blocked requests\n")
     }
 
     for _, hostname := range config.Allow {

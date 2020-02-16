@@ -13,9 +13,7 @@ import (
         "github.com/google/gopacket"
         "github.com/google/gopacket/afpacket"
         "github.com/google/gopacket/layers"
-        "github.com/google/gopacket/pcap"
         "github.com/iovisor/gobpf/elf"
-        "golang.org/x/net/bpf"
         log "github.com/sirupsen/logrus"
 )
 
@@ -127,7 +125,11 @@ func Main(ebpf_binary string) {
     go process_tcp(channel, lost_chan)
 
     if config.Use_Classic_BPF {
-        afpacketHandle := get_packet_handle("udp and port 53")
+        afpacketHandle, err := GetPacketHandle("udp and port 53")
+        if err != nil {
+            panic(err)
+        }
+
         defer afpacketHandle.Close()
         process_alt_dns(afpacketHandle)
     } else {
@@ -148,42 +150,6 @@ func process_dns(dns_stream *os.File) {
 
         go readAndProcess(byte_chunk, length)
     }
-}
-
-func get_packet_handle(bpf_filter string) *afpacket.TPacket {
-    var afpacketHandle *afpacket.TPacket
-    var err error
-
-    afpacketHandle, err = afpacket.NewTPacket(
-        afpacket.OptFrameSize(65536),
-        afpacket.OptBlockSize(8388608),
-        afpacket.OptNumBlocks(1),
-        afpacket.OptAddVLANHeader(false),
-        afpacket.OptPollTimeout(-10000000),
-        afpacket.SocketRaw,
-        afpacket.TPacketVersion3)
-
-    if err != nil {
-        panic(err)
-    }
-
-    pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, 65536, "udp and port 53")
-    bpfIns := []bpf.RawInstruction{}
-    for _, ins := range pcapBPF {
-        bpfIns2 := bpf.RawInstruction{
-            Op: ins.Code,
-            Jt: ins.Jt,
-            Jf: ins.Jf,
-            K:  ins.K,
-        }
-        bpfIns = append(bpfIns, bpfIns2)
-    }
-
-    if afpacketHandle.SetBPF(bpfIns); err != nil {
-        panic(err)
-    }
-
-    return afpacketHandle
 }
 
 func process_alt_dns(afpacketHandle *afpacket.TPacket) {
@@ -236,33 +202,43 @@ func process_tcp(receiver chan []byte, lost chan uint64) {
 
 func parse_tcp_event(event tcp_v4) {
     // exclude stuff bound to 0.0.0.0
-    // remember that these include udp too
+    // FIXME: remember that these include udp too
     if event.Addr == 0 {
         // dns_log.Errorf("family: %d, addr: %d\n", event.Family, event.Addr)
         return
     }
 
+    // FIXME: here's an idea:
+    // what if we pulled this stuff as soon as a new process spawns?
+    // it would probably be more efficient than reading the cgroup files
+    // on every tcp event
     pid := int(event.Pid & 0xFFFFFFFF)
     var container_info *ContainerInfo
-    if pid_to_namespace[pid] != nil {
-        container_info = pid_to_namespace[pid]
-    } else {
-        events = append(events, fmt.Sprintf("querying container info pid=%d\n", pid))
-        container_info = GetContainerInfo(pid)
-        pid_to_namespace[pid] = container_info
-    }
-
     container_hostname := "none"
     container_image := "none"
     container_ip := "none"
-    if container_info != nil {
-        container_image = container_info.Image
-        container_ip = container_info.IpAddress
-        container_hostname = container_info.Hostname
+
+    if config.Container_Metadata {
+        if pid_to_namespace[pid] != nil {
+            container_info = pid_to_namespace[pid]
+        } else {
+            // events = append(events, fmt.Sprintf("querying container info pid=%d\n", pid))
+            container_info = GetContainerInfo(pid)
+            pid_to_namespace[pid] = container_info
+        }
+
+        if container_info != nil {
+            container_image = container_info.Image
+            container_ip = container_info.IpAddress
+            container_hostname = container_info.Hostname
+        }
     }
 
-
     ip_address := Long2ip(event.Addr)
+    if ip_address == config.Trusted_Dns {
+        return
+    }
+
     dns_name := ip_to_hostname[ip_address]
 
     ip_tags  := ipv4map.get_tags(int(event.Addr))
@@ -271,24 +247,49 @@ func parse_tcp_event(event tcp_v4) {
         dns_name_alt = ip_tags[0]
     }
 
-    // this checks only the hash table, which assumes ip:host is 1:1
+    // FIXME: this checks only the hash table, which assumes ip:host is 1:1
     // the bst assumes ip:host is 1:many (more realistic) but I don't
     // feel like implementing something to check if two arrays overlap
     // it also doesn't check the container specific allow list
+
+    // FIXME: we should consider caching the decision too
+    // if an IP is allowed/blocked now, it will not change later
+    // what if one dns entry for an ip is allowed, and another dns entry is not?
     allowed := tag_exists(config.Allow, dns_name)
-    events = append(events, fmt.Sprintf(
-    "process.tcp_v4 comm=%s pid=%d connection=%s:%d allowed=%t dns.entry=%s dns.entry2=%s container.image=%s container.hostname=%s container.ip=%s\n",
-    event.Comm,
-    pid,
-    ip_address,
-    event.Port,
-    allowed,
-    dns_name,
-    dns_name_alt,
-    container_image,
-    container_hostname,
-    container_ip,
-    ))
+    if dns_name == "" {
+        // FIXME: oddly enough, this only happens when container metadata is enabled
+        events = append(events, fmt.Sprintf("process.missing comm=%s pid=%d connection=%s:%d\n", event.Comm, pid, ip_address, event.Port))
+    }
+
+    if config.Log_Blocked {
+        if !allowed {
+            events = append(events, fmt.Sprintf(
+                "process.blocked comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
+                event.Comm,
+                pid,
+                ip_address,
+                event.Port,
+                dns_name,
+                container_image,
+                container_hostname,
+                container_ip,
+            ))
+        }
+    } else {
+        events = append(events, fmt.Sprintf(
+        "process.tcp_v4 comm=%s pid=%d connection=%s:%d allowed=%t dns.entry=%s dns.entry2=%s container.image=%s container.hostname=%s container.ip=%s\n",
+        event.Comm,
+        pid,
+        ip_address,
+        event.Port,
+        allowed,
+        dns_name,
+        dns_name_alt,
+        container_image,
+        container_hostname,
+        container_ip,
+        ))
+    }
 }
 
 func extract_dns(chunk []byte, size int) gopacket.Packet {
@@ -307,6 +308,49 @@ func extract_dns(chunk []byte, size int) gopacket.Packet {
 }
 
 func log_dns_event(dns *layers.DNS) {
+    if len(dns.Answers) > 0 {
+        for _, answer := range dns.Answers {
+            switch answer.Type {
+                default:
+                    fmt.Printf("unknown dns type: %s\n", answer.Type.String())
+                case layers.DNSTypeAAAA:
+                    ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
+                    if config.Log_Dns {
+                        events = append(
+                            events,
+                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
+                            )
+                    }
+                case layers.DNSTypeA:
+                    ipv4map.insert(ipv4toint(answer.IP), []string{string(dns.Questions[0].Name)})
+                    ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
+                    if config.Log_Dns {
+                        events = append(
+                            events,
+                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
+                            )
+                    }
+                case layers.DNSTypeCNAME:
+                    ip_to_hostname[string(answer.CNAME)] = string(dns.Questions[0].Name)
+                    if config.Log_Dns {
+                        events = append(
+                            events,
+                            fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.CNAME),
+                            )
+                    }
+            }
+        }
+    } else if len(dns.Questions) > 0 {
+        if config.Log_Dns {
+            events = append(
+                events,
+                fmt.Sprintf("dns.query hostname=%s type=%s\n", dns.Questions[0].Name, dns.Questions[0].Type.String()),
+                )
+        }
+    } else {
+        fmt.Printf("we have no answers fuq\n")
+    }
+
     if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
         fmt.Printf("====\n")
         for i, event := range events {
@@ -324,41 +368,6 @@ func log_dns_event(dns *layers.DNS) {
                 fmt.Printf("%s\n", string(b))
             }
         }
-    }
-
-    if len(dns.Answers) > 0 {
-        for _, answer := range dns.Answers {
-            switch answer.Type {
-                default:
-                    fmt.Printf("unknown dns type: %s\n", answer.Type.String())
-                case layers.DNSTypeAAAA:
-                    ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
-                    events = append(
-                        events,
-                        fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
-                        )
-                case layers.DNSTypeA:
-                    ipv4map.insert(ipv4toint(answer.IP), []string{string(dns.Questions[0].Name)})
-                    ip_to_hostname[string(answer.IP.String())] = string(dns.Questions[0].Name)
-                    events = append(
-                        events,
-                        fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.IP),
-                        )
-                case layers.DNSTypeCNAME:
-                    ip_to_hostname[string(answer.CNAME)] = string(dns.Questions[0].Name)
-                    events = append(
-                        events,
-                        fmt.Sprintf("dns.answer hostname=%s response=%s\n", dns.Questions[0].Name, answer.CNAME),
-                        )
-            }
-        }
-    } else if len(dns.Questions) > 0 {
-        events = append(
-            events,
-            fmt.Sprintf("dns.query hostname=%s type=%s\n", dns.Questions[0].Name, dns.Questions[0].Type.String()),
-            )
-    } else {
-        fmt.Printf("we have no answers fuq\n")
     }
 }
 
