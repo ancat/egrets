@@ -9,12 +9,15 @@ import (
 
 type EgretsConfig struct {
     Container_Metadata bool
+    Async_Container_Metadata bool
     Use_Classic_BPF bool
     Log_Blocked bool
     Log_Dns bool
     Allow []string
     Trusted_Dns string
     Container_Allow map[string][]string
+    Cache_Http bool
+    Manual_Packet_Decode bool
 }
 
 func LoadEgretsConfig(filename string) *EgretsConfig {

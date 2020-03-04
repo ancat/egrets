@@ -34,6 +34,10 @@ type tcp_v4 struct {
     Family uint64
 }
 
+type exec_event struct {
+    Pid    uint64
+}
+
 type EventConnectV4 struct {
     Comm              [16]byte
     Pid               uint
@@ -117,6 +121,27 @@ func Main(ebpf_binary string) {
         log.Fatalf("couldn't turn fd into a file")
     }
 
+    // we only need these if we want container metadata asynchronously
+    if config.Container_Metadata && config.Async_Container_Metadata {
+        if err := mod.EnableTracepoint("tracepoint/sched/sched_process_fork"); err != nil {
+            dns_log.Fatalf("Failed to enable tracepoint: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+        }
+
+        if err := mod.EnableKprobe("kprobe/sys_execve", 1); err != nil {
+            dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+        }
+
+        // this is used by both the sched_process_fork tp and the execve kp
+        exec_channel := make(chan []byte)
+        exec_lost_chan := make(chan uint64)
+        err = GetMap(mod, "exec_events", exec_channel, exec_lost_chan)
+        if err != nil {
+            panic(err)
+        }
+
+        go process_execs(exec_channel, exec_lost_chan)
+    }
+
     if err := mod.EnableKprobe("kprobe/sys_connect", 1); err != nil {
         dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
     }
@@ -127,6 +152,7 @@ func Main(ebpf_binary string) {
     if err != nil {
         panic(err)
     }
+
 
     go process_tcp(channel, lost_chan)
 
@@ -154,7 +180,7 @@ func process_dns(dns_stream *os.File) {
             continue
         }
 
-        go readAndProcess(byte_chunk, length)
+        go process_packet(byte_chunk, length)
     }
 }
 
@@ -167,7 +193,7 @@ func process_alt_dns(afpacketHandle *afpacket.TPacket) {
             panic(err)
         }
 
-        go readAndProcess(data, len(data))
+        go process_packet(data, len(data))
         continue
 
         packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
@@ -179,6 +205,36 @@ func process_alt_dns(afpacketHandle *afpacket.TPacket) {
         dns := dns_packet.(*layers.DNS)
         log_dns_event(dns)
     }
+}
+
+func process_execs(receiver chan []byte, lost chan uint64) {
+        fmt.Printf("execves processing starting\n")
+        for {
+            select {
+            case data, ok := <-receiver:
+                if !ok {
+                    return
+                }
+
+                buffer := bytes.NewBuffer(data)
+                var event exec_event
+                err := binary.Read(buffer, binary.LittleEndian, &event)
+                if err != nil {
+                    panic(err)
+                }
+
+                go func() {
+                    pid := int(event.Pid & 0xFFFFFFFF)
+                    var container_info *ContainerInfo
+                    container_info = GetContainerInfo(pid)
+                    pid_to_namespace[pid] = container_info
+                }()
+            case _, ok := <-lost:
+                if !ok {
+                    return
+                }
+            }
+        }
 }
 
 func process_tcp(receiver chan []byte, lost chan uint64) {
@@ -214,10 +270,6 @@ func parse_tcp_event(event tcp_v4) {
         return
     }
 
-    // FIXME: here's an idea:
-    // what if we pulled this stuff as soon as a new process spawns?
-    // it would probably be more efficient than reading the cgroup files
-    // on every tcp event
     pid := int(event.Pid & 0xFFFFFFFF)
     var container_info *ContainerInfo
     container_hostname := "none"
@@ -225,20 +277,21 @@ func parse_tcp_event(event tcp_v4) {
     container_ip := "none"
 
     if config.Container_Metadata {
-        // FIXME: data race in pid_to_namespace
-        if pid_to_namespace[pid] != nil {
-            container_info = pid_to_namespace[pid]
-        } else {
-            event_channel <- fmt.Sprintf("querying container info pid=%d\n", pid)
+        container_info = pid_to_namespace[pid]
+        if container_info == nil && !config.Async_Container_Metadata {
             container_info = GetContainerInfo(pid)
             pid_to_namespace[pid] = container_info
         }
+    }
 
-        if container_info != nil {
-            container_image = container_info.Image
-            container_ip = container_info.IpAddress
-            container_hostname = container_info.Hostname
-        }
+    if container_info != nil {
+        container_image = container_info.Image
+        container_ip = container_info.IpAddress
+        container_hostname = container_info.Hostname
+    }
+
+    if container_image == "fail" {
+        event_channel <- fmt.Sprintf("container.missing comm=%s pid=%d\n", event.Comm, pid)
     }
 
     ip_address := Long2ip(event.Addr)
@@ -271,6 +324,7 @@ func parse_tcp_event(event tcp_v4) {
 
     if config.Log_Blocked {
         if !allowed {
+            // syscall.Kill(pid, 9)
             event_channel <- fmt.Sprintf(
                 "process.blocked comm=%s pid=%d connection=%s:%d dns.entry=%s container.image=%s container.hostname=%s container.ip=%s\n",
                 event.Comm,
@@ -317,7 +371,6 @@ func extract_dns(chunk []byte, size int) gopacket.Packet {
 
 func log_dns_event(dns *layers.DNS) {
     var dns_event string
-
     if len(dns.Answers) > 0 {
         for _, answer := range dns.Answers {
             switch answer.Type {
@@ -350,10 +403,38 @@ func log_dns_event(dns *layers.DNS) {
 
     if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
         ip_to_hostname = make(map[string]string)
+        event_channel <- "mapping cleared\n"
     }
 }
 
-func readAndProcess(chunk []byte, length int) {
+// experimental, nothing calls it yet
+func process_packet_manual(chunk[]byte, length int) {
+    var err error
+    ether := layers.Ethernet{}
+    if err = ether.DecodeFromBytes(chunk, gopacket.NilDecodeFeedback); err != nil {
+        log.Println(err)
+    }
+    if ether.EthernetType != layers.EthernetTypeIPv4 {
+        return// no ipv6 yet
+    }
+    ipv44 := layers.IPv4{}
+    if err = ipv44.DecodeFromBytes(ether.Payload, gopacket.NilDecodeFeedback); err != nil {
+        panic("wat")
+    }
+    udpp := layers.UDP{}
+    if err = udpp.DecodeFromBytes(ipv44.Payload, gopacket.NilDecodeFeedback); err != nil {
+        panic("no udp")
+    }
+    dns_packet := layers.DNS{}
+    err = dns_packet.DecodeFromBytes(udpp.Payload, gopacket.NilDecodeFeedback);
+    if err == nil {
+        log_dns_event(&dns_packet)
+    } else {
+        panic(err)
+    }
+}
+
+func process_packet(chunk []byte, length int) {
     packet := gopacket.NewPacket(chunk[:length], layers.LayerTypeEthernet, gopacket.NoCopy)
 
     dns_packet := packet.Layer(layers.LayerTypeDNS)
@@ -361,9 +442,6 @@ func readAndProcess(chunk []byte, length int) {
         return
     }
 
-    processed_count += 1
-
     dns := dns_packet.(*layers.DNS)
     log_dns_event(dns)
-    log.Debugf("processed %d packets\n", processed_count)
 }

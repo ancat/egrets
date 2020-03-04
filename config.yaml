@@ -1,11 +1,23 @@
 # if you don't use containers, save the lookup time
 container_metadata: true
-log_blocked: true
-log_dns: true
+async_container_metadata: true
+log_blocked: false
+log_dns: false
+
+cache_http: true
 
 # classic bpf is borked
 use_classic_bpf: false
+
+# manually decode packets (experimental, unused)
+manual_packet_decode: true
+
 trusted_dns: 67.207.67.3
+# explicit blocks (threat intel maybe?)
+# not implemented yet
+block:
+    # don't let containers talk to the host
+    - 172.17.0.1
 allow:
     - deb.debian.org
     - repo.iovisor.org
@@ -18,6 +30,7 @@ allow:
     - security.debian.org
     - security.ubuntu.com
     - download.docker.com
+    - security-cdn.debian.org
 container_allow:
     gremlinweb:
         - security.debian.org

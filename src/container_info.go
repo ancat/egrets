@@ -18,6 +18,9 @@ type ContainerInfo struct {
     Image string
 }
 
+// FIXME: what if we pulled this in the kprobe, and not here?
+// it would mean less io/less chance to bork
+// https://github.com/ntop/libebpfflow/blob/322329d/ebpflow_code.ebpf#L77
 func GetContainerInfo(pid int) *ContainerInfo {
     cgroup_name := GetCpusetCgroup(pid)
 
@@ -71,14 +74,19 @@ func GetCpusetCgroup(pid int) []byte {
     return nil
 }
 
+var httpc *http.Client
 func GetDockerMetadata(docker_id []byte) *ContainerInfo {
     unix_path := fmt.Sprintf("http://unix/v1.24/containers/%s/json", string(docker_id))
-    httpc := http.Client{
-        Transport: &http.Transport{
-            DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-                return net.Dial("unix", "/var/run/docker.sock")
+
+    // FIXME: turn httpc into a parameter so we don't have to check globals
+    if httpc == nil || config.Cache_Http == false {
+        httpc = &http.Client{
+            Transport: &http.Transport{
+                DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+                    return net.Dial("unix", "/var/run/docker.sock")
+                },
             },
-        },
+        }
     }
 
     response, err := httpc.Get(unix_path)
