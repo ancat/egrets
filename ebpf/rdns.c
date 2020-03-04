@@ -84,6 +84,18 @@ struct ip_t {
   unsigned int    dst;            // byte 16
 } __attribute__((packed));;
 
+// pulled from /sys/kernel/debug/tracing/events/sched/sched_process_fork/format
+struct sched_process_fork {
+    unsigned short common_type;
+    unsigned char  common_flags;
+    unsigned char  common_preempt_count;
+    uint32_t       common_pid;
+    char           parent_comm[16];
+    uint32_t       parent_pid;
+    char           child_comm[16];
+    uint32_t       child_pid;
+};
+
 # define printk(fmt, ...)                        \
         ({                            \
             char ____fmt[] = fmt;                \
@@ -119,6 +131,15 @@ struct bpf_map_def SEC("maps/events") tcp_v4 = {
     .namespace = "",
 };
 
+struct bpf_map_def SEC("maps/exec_events") exec_events = {
+    .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+    .key_size = sizeof(int),
+    .value_size = sizeof(__u32),
+    .max_entries = 1024,
+    .pinning = 0,
+    .namespace = "",
+};
+
 struct netevent_t {
     uint64_t pid;
     uint64_t ts;
@@ -128,7 +149,36 @@ struct netevent_t {
     uint16_t port;
     uint32_t address;
     uint32_t inet_family;
-} ;
+};
+
+struct execevent_t {
+    uint64_t pid;
+};
+
+SEC("tracepoint/sched/sched_process_fork")
+int tracepoint__sched_process_fork(struct sched_process_fork *ctx) {
+    u32 cpu = bpf_get_smp_processor_id();
+    struct execevent_t event = {0};
+    event.pid = ctx->child_pid;
+    bpf_perf_event_output(ctx, &exec_events, cpu, &event, sizeof(event));
+    //printk("tracepoint :~) %d %d\n", ctx->child_pid, ctx->parent_pid);
+    return 0;
+}
+
+SEC("kprobe/sys_execve")
+int kprobe__sys_execve(struct pt_regs *ctx) {
+    u32 cpu = bpf_get_smp_processor_id();
+    struct execevent_t event = {0};
+
+    //unsigned long filename = ctx->di;
+    //bpf_probe_read(event.path, sizeof(event.path)-1, (void *)filename);
+
+    event.pid = bpf_get_current_pid_tgid();
+    bpf_perf_event_output(ctx, &exec_events, cpu, &event, sizeof(event));
+
+    //printk("execve! @ %s [%d]\n", event.path, event.pid);
+    return 0;
+}
 
 SEC("kprobe/sys_connect")
 int kprobe__sys_connect(struct pt_regs *ctx) {
