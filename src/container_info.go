@@ -22,20 +22,20 @@ type ContainerInfo struct {
 // it would mean less io/less chance to bork
 // https://github.com/ntop/libebpfflow/blob/322329d/ebpflow_code.ebpf#L77
 func GetContainerInfo(pid int) *ContainerInfo {
-    cgroup_name := GetCpusetCgroup(pid)
-
-    if cgroup_name == nil || bytes.Equal(cgroup_name, []byte("/")) {
-        return nil
-    }
+    cgroup_name, err := GetCpusetCgroup(pid)
 
     // this makes spotting failures more obvious without having to crash
     // or worse, assume that there's no container info
-    if bytes.Equal(cgroup_name, []byte("fail")) {
+    if err != nil {
         cinfo := ContainerInfo{}
         cinfo.Hostname = "fail"
         cinfo.IpAddress = "fail"
         cinfo.Image = "fail"
         return &cinfo
+    }
+
+    if cgroup_name == nil || bytes.Equal(cgroup_name, []byte("/")) {
+        return nil
     }
 
     if bytes.Contains(cgroup_name, []byte("/docker")) {
@@ -46,11 +46,11 @@ func GetContainerInfo(pid int) *ContainerInfo {
     return nil
 }
 
-func GetCpusetCgroup(pid int) []byte {
+func GetCpusetCgroup(pid int) ([]byte, error) {
     cgroup_path := fmt.Sprintf("/proc/%d/cgroup", pid)
     cgroup_data, err := ioutil.ReadFile(cgroup_path)
     if err != nil {
-        return []byte("fail")
+        return nil, err
     }
 
     lines := bytes.Split(cgroup_data, []byte("\n"))
@@ -67,11 +67,11 @@ func GetCpusetCgroup(pid int) []byte {
         cgroup_controller = parts[1]
         cgroup_name = parts[2]
         if cgroup_id == 1 || bytes.Equal(cgroup_controller, []byte("cpuset")) {
-            return cgroup_name
+            return cgroup_name, nil
         }
     }
 
-    return nil
+    return nil, fmt.Errorf("could not pull cgroup name from /proc/$$/cgroup")
 }
 
 var httpc *http.Client
