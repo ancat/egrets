@@ -1,4 +1,8 @@
 DOCKER_IMAGE=egrets_builder
+CFLAGS:=
+ifdef DEBUG
+CFLAGS=-DDEBUG
+endif
 
 all: egrets-main build-docker-image build-ebpf-object
 
@@ -17,7 +21,7 @@ build-ebpf-object:
 		-v $(PWD)/ebpf:/dist/ \
 		--workdir=/dist/ \
 		$(DOCKER_IMAGE) \
-		make
+		make CFLAGS=$(CFLAGS)
 
 egrets-main:
 	go build

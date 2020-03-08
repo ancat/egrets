@@ -1,7 +1,8 @@
 LINUX_HEADERS=$(shell rpm -ql kernel-devel | head -1)
+CFLAGS=$(CFLAGS)
 
 all:
-	clang -D__KERNEL__ -D__ASM_SYSREG_H \
+	clang $(CFLAGS) -D__KERNEL__ -D__ASM_SYSREG_H \
 		-Wno-unused-value \
 		-Wno-pointer-sign \
 		-Wno-compare-distinct-pointer-types \
