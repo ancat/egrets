@@ -36,6 +36,7 @@ type tcp_v4 struct {
 
 type exec_event struct {
     Pid    uint64
+    Type   uint64
 }
 
 type EventConnectV4 struct {
@@ -65,6 +66,7 @@ var config_file = flag.String("f", "config.yaml", "config file (default `config.
 var config *EgretsConfig
 var ipv4map = IpNode{}
 var event_channel chan string
+var stats = EgretsStats{}
 
 func GetLogger(logger_name string) *log.Logger  {
     logger := log.New()
@@ -100,7 +102,7 @@ func Main(ebpf_binary string) {
 
     mod, err := LoadModuleElf(ebpf_binary)
     if err != nil {
-        panic("nil module")
+        panic(err)
     }
 
     fd, socketFilter, err := GetSocketFilter(mod, "socket/filter_udp")
@@ -227,6 +229,7 @@ func process_execs(receiver chan []byte, lost chan uint64) {
                     pid := int(event.Pid & 0xFFFFFFFF)
                     var container_info *ContainerInfo
                     container_info = GetContainerInfo(pid)
+                    // FIXME data race
                     pid_to_namespace[pid] = container_info
                 }()
             case _, ok := <-lost:
@@ -253,6 +256,7 @@ func process_tcp(receiver chan []byte, lost chan uint64) {
                     panic(err)
                 }
 
+                stats.PacketsSeen++
                 go parse_tcp_event(event)
             case _, ok := <-lost:
                 if !ok {
@@ -292,6 +296,7 @@ func parse_tcp_event(event tcp_v4) {
 
     if container_image == "fail" {
         event_channel <- fmt.Sprintf("container.missing comm=%s pid=%d\n", event.Comm, pid)
+        stats.MissingContainer++
     }
 
     ip_address := Long2ip(event.Addr)
@@ -320,6 +325,7 @@ func parse_tcp_event(event tcp_v4) {
     if dns_name == "" {
         // FIXME: oddly enough, this only happens when container metadata is enabled
         event_channel <- fmt.Sprintf("process.missing comm=%s pid=%d connection=%s:%d\n", event.Comm, pid, ip_address, event.Port)
+        stats.MissingDns++
     }
 
     if config.Log_Blocked {
@@ -401,9 +407,13 @@ func log_dns_event(dns *layers.DNS) {
         fmt.Printf("we have no answers fuq\n")
     }
 
-    if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
+    if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "reset" {
+        ip_to_hostname = make(map[string]string)
+    } else if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
+        event_channel <- fmt.Sprintf("Stats:\n%+v\n", stats)
         ip_to_hostname = make(map[string]string)
         event_channel <- "mapping cleared\n"
+        stats.MissingDns = 0; stats.MissingContainer = 0; stats.PacketsSeen = 0; stats.QueriesSeen = 0;
     }
 }
 
@@ -444,4 +454,5 @@ func process_packet(chunk []byte, length int) {
 
     dns := dns_packet.(*layers.DNS)
     log_dns_event(dns)
+    stats.QueriesSeen++
 }

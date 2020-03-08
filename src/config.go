@@ -7,6 +7,13 @@ import (
     "gopkg.in/yaml.v2"
 )
 
+type EgretsStats struct {
+    PacketsSeen      int
+    QueriesSeen      int
+    MissingDns       int
+    MissingContainer int
+}
+
 type EgretsConfig struct {
     Container_Metadata bool
     Async_Container_Metadata bool

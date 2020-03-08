@@ -1,3 +1,5 @@
+#define randomized_struct_fields_start  struct {
+#define randomized_struct_fields_end    };
 #include <linux/kconfig.h>
 
 #pragma clang diagnostic push
@@ -16,6 +18,8 @@
 #pragma clang diagnostic pop
 #include <net/inet_sock.h>
 #include <net/net_namespace.h>
+
+#include <linux/sched.h>
 
 #define ETH_LEN 14
 
@@ -153,30 +157,36 @@ struct netevent_t {
 
 struct execevent_t {
     uint64_t pid;
+    uint64_t type;
 };
 
 SEC("tracepoint/sched/sched_process_fork")
 int tracepoint__sched_process_fork(struct sched_process_fork *ctx) {
     u32 cpu = bpf_get_smp_processor_id();
+
     struct execevent_t event = {0};
     event.pid = ctx->child_pid;
+    event.type = 2;
     bpf_perf_event_output(ctx, &exec_events, cpu, &event, sizeof(event));
-    //printk("tracepoint :~) %d %d\n", ctx->child_pid, ctx->parent_pid);
+
+    #ifdef DEBUG
+    printk("tracepoint :~) %d %d\n", ctx->child_pid, ctx->parent_pid);
+    #endif
     return 0;
 }
 
 SEC("kprobe/sys_execve")
 int kprobe__sys_execve(struct pt_regs *ctx) {
     u32 cpu = bpf_get_smp_processor_id();
+
     struct execevent_t event = {0};
-
-    //unsigned long filename = ctx->di;
-    //bpf_probe_read(event.path, sizeof(event.path)-1, (void *)filename);
-
     event.pid = bpf_get_current_pid_tgid();
+    event.type = 1;
     bpf_perf_event_output(ctx, &exec_events, cpu, &event, sizeof(event));
 
-    //printk("execve! @ %s [%d]\n", event.path, event.pid);
+    #ifdef DEBUG
+    printk("execve! @ [%d]\n", event.pid);
+    #endif
     return 0;
 }
 
