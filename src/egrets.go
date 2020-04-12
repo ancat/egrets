@@ -55,11 +55,9 @@ func Long2ip(ipLong uint32) string {
     return ip.String()
 }
 
-var processed_count int
 var ip_to_hostname map[string]string
 // consider caching namespace -> container info
 var pid_to_namespace map[int]*ContainerInfo
-var dns_log *log.Logger
 
 var dump_config = flag.Bool("d", false, "dump the parsed config and exit")
 var config_file = flag.String("f", "config.yaml", "config file (default `config.yaml`")
@@ -67,18 +65,6 @@ var config *EgretsConfig
 var ipv4map = IpNode{}
 var event_channel chan string
 var stats = EgretsStats{}
-
-func GetLogger(logger_name string) *log.Logger  {
-    logger := log.New()
-    //logger.SetLevel(log.WarnLevel)
-    logger.Formatter = &TextFormatter{
-        LoggerName: logger_name,
-        ForceColors: true,
-    }
-
-    logger.SetOutput(os.Stdout)
-    return logger
-}
 
 func Main(ebpf_binary string) {
     flag.Parse()
@@ -96,18 +82,17 @@ func Main(ebpf_binary string) {
         }
     }()
 
-    dns_log = GetLogger("DNS")
     ip_to_hostname = make(map[string]string)
     pid_to_namespace = make(map[int]*ContainerInfo)
 
     mod, err := LoadModuleElf(ebpf_binary)
     if err != nil {
-        panic(err)
+        log.Fatalf("Failed to load ebpf binary: %s", err)
     }
 
     fd, socketFilter, err := GetSocketFilter(mod, "socket/filter_udp")
     if err != nil {
-        panic(err)
+        log.Fatalf("Failed loading UDP socket filter: %s", err)
     }
 
     defer elf.DetachSocketFilter(socketFilter, fd)
@@ -126,11 +111,11 @@ func Main(ebpf_binary string) {
     // we only need these if we want container metadata asynchronously
     if config.Container_Metadata && config.Async_Container_Metadata {
         if err := mod.EnableTracepoint("tracepoint/sched/sched_process_fork"); err != nil {
-            dns_log.Fatalf("Failed to enable tracepoint: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+            log.Fatalf("Failed to enable tracepoint: %s\nMake sure you are running as root and that debugfs is mounted!", err)
         }
 
         if err := mod.EnableKprobe("kprobe/sys_execve", 1); err != nil {
-            dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+            log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
         }
 
         // this is used by both the sched_process_fork tp and the execve kp
@@ -138,21 +123,21 @@ func Main(ebpf_binary string) {
         exec_lost_chan := make(chan uint64)
         err = GetMap(mod, "exec_events", exec_channel, exec_lost_chan)
         if err != nil {
-            panic(err)
+            log.Fatalf("Failed to load exec events map: %s", err)
         }
 
         go process_execs(exec_channel, exec_lost_chan)
     }
 
     if err := mod.EnableKprobe("kprobe/sys_connect", 1); err != nil {
-        dns_log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
+        log.Fatalf("Failed to set up kprobes: %s\nMake sure you are running as root and that debugfs is mounted!", err)
     }
 
     channel := make(chan []byte)
     lost_chan := make(chan uint64)
     err = GetMap(mod, "events", channel, lost_chan)
     if err != nil {
-        panic(err)
+        log.Fatalf("Failed to load events map: %s", err)
     }
 
 
@@ -172,7 +157,7 @@ func Main(ebpf_binary string) {
 }
 
 func process_dns(dns_stream *os.File) {
-    fmt.Printf("starting dns boye\n")
+    log.Printf("starting dns boye")
     // we should be using channels for this
     // https://www.openwall.com/lists/musl/2018/10/11/2
     for {
@@ -187,7 +172,7 @@ func process_dns(dns_stream *os.File) {
 }
 
 func process_alt_dns(afpacketHandle *afpacket.TPacket) {
-    fmt.Printf("starting alt dns boye\n")
+    log.Printf("starting alt dns boye")
 
     for {
         data, _, err := afpacketHandle.ZeroCopyReadPacketData()
@@ -210,7 +195,8 @@ func process_alt_dns(afpacketHandle *afpacket.TPacket) {
 }
 
 func process_execs(receiver chan []byte, lost chan uint64) {
-        fmt.Printf("execves processing starting\n")
+        log.Printf("execves processing starting")
+
         for {
             select {
             case data, ok := <-receiver:
@@ -241,7 +227,8 @@ func process_execs(receiver chan []byte, lost chan uint64) {
 }
 
 func process_tcp(receiver chan []byte, lost chan uint64) {
-        fmt.Printf("tcp processing starting\n")
+        log.Printf("tcp processing starting")
+
         for {
             select {
             case data, ok := <-receiver:
@@ -270,7 +257,6 @@ func parse_tcp_event(event tcp_v4) {
     // exclude stuff bound to 0.0.0.0
     // FIXME: remember that these include udp too
     if event.Addr == 0 {
-        // dns_log.Errorf("family: %d, addr: %d\n", event.Family, event.Addr)
         return
     }
 
@@ -409,11 +395,9 @@ func log_dns_event(dns *layers.DNS) {
 
     if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "reset" {
         ip_to_hostname = make(map[string]string)
-    } else if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
-        event_channel <- fmt.Sprintf("Stats:\n%+v\n", stats)
-        ip_to_hostname = make(map[string]string)
-        event_channel <- "mapping cleared\n"
         stats.MissingDns = 0; stats.MissingContainer = 0; stats.PacketsSeen = 0; stats.QueriesSeen = 0;
+    } else if dns.QR && len(dns.Questions) > 0 && string(dns.Questions[0].Name) == "dump" {
+        fmt.Printf("Stats:\n%+v\n", stats)
     }
 }
 
